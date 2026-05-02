@@ -5,6 +5,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
+    "build": "echo 'Backend ready for Vercel'",
     "worker": "python workers/main.py",
     "worker:dev": "nodemon --exec python workers/main.py",
     "node-worker": "node workers/nodeWorker.js",
