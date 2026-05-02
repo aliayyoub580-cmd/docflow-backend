@@ -8,11 +8,34 @@ import cors from "cors";
 
 const app = express();
 
+const configuredOrigins = [
+  process.env.FRONTEND_URL,
+  ...(process.env.FRONTEND_URLS || "").split(",")
+]
+  .map((origin) => (origin || "").trim())
+  .filter(Boolean);
+
+const corsOptionsDelegate = (req, callback) => {
+  const requestOrigin = req.header("Origin");
+
+  if (configuredOrigins.length === 0) {
+    // Keep backend reachable if env vars are missing (safe default for non-credentialed requests).
+    callback(null, { origin: true, credentials: false });
+    return;
+  }
+
+  const isAllowed = Boolean(requestOrigin) && configuredOrigins.includes(requestOrigin);
+
+  callback(null, {
+    origin: isAllowed,
+    credentials: isAllowed,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+  });
+};
+
 // Middleware
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "*",
-  credentials: true
-}));
+app.use(cors(corsOptionsDelegate));
+app.options("*", cors(corsOptionsDelegate));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
