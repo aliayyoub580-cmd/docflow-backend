@@ -172,6 +172,53 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+app.get("/api/setup", async (req, res) => {
+  try {
+    const supabaseConfigured = Boolean(supabaseService.supabase);
+    const config = {
+      supabase_configured: supabaseConfigured,
+      supabase_url: process.env.SUPABASE_URL ? "✓ Set" : "✗ Missing",
+      supabase_key: process.env.SUPABASE_SERVICE_ROLE_KEY ? "✓ Set" : "✗ Missing",
+      input_bucket: process.env.SUPABASE_INPUT_BUCKET || "docflow-inputs",
+      output_bucket: process.env.SUPABASE_OUTPUT_BUCKET || "docflow-outputs"
+    };
+
+    if (supabaseService.supabase) {
+      try {
+        const { data, error } = await supabaseService.supabase
+          .from("conversion_jobs")
+          .select("COUNT(*)", { count: "exact", head: true });
+        config.database_connection = error ? "✗ " + error.message : "✓ Connected";
+      } catch (dbError) {
+        config.database_connection = "✗ " + dbError.message;
+      }
+
+      try {
+        const { data, error } = await supabaseService.supabase.storage.listBuckets();
+        if (error) {
+          config.storage_connection = "✗ " + error.message;
+        } else {
+          const buckets = data?.map(b => b.name) || [];
+          config.storage_connection = "✓ Connected";
+          config.available_buckets = buckets;
+        }
+      } catch (storageError) {
+        config.storage_connection = "✗ " + storageError.message;
+      }
+    }
+
+    return res.json({
+      status: supabaseConfigured ? "configured" : "not_configured",
+      configuration: config
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Setup verification failed",
+      message: error.message
+    });
+  }
+});
+
 app.post("/api/convert", upload.single("file"), multerErrorHandler, async (req, res, next) => {
   try {
     const tool = req.body?.tool;
