@@ -34,7 +34,23 @@ const writeLocalStore = (store) => {
   fs.writeFileSync(localStoragePath, JSON.stringify(store, null, 2));
 };
 
-const supabase = usingSupabase ? createClient(supabaseUrl, supabaseKey) : null;
+let supabase = null;
+if (usingSupabase) {
+  try {
+    console.log("[INFO] Initializing Supabase client with URL:", supabaseUrl);
+    supabase = createClient(supabaseUrl, supabaseKey);
+    console.log("[INFO] ✓ Supabase client initialized successfully");
+  } catch (error) {
+    console.error("[ERROR] Failed to initialize Supabase client:", error.message);
+    console.error("[DEBUG] Stack:", error.stack);
+    supabase = null;
+  }
+} else {
+  const missingVars = [];
+  if (!supabaseUrl) missingVars.push("SUPABASE_URL");
+  if (!supabaseKey) missingVars.push("SUPABASE_SERVICE_ROLE_KEY");
+  console.warn("[WARN] Supabase not configured. Using local JSON fallback. Missing:", missingVars.join(", "));
+}
 
 /**
  * Create conversion job record
