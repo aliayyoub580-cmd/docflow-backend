@@ -1,46 +1,133 @@
 /**
  * Vercel serverless function entry point
- * Simplified backend API for Vercel deployment
+ * Conversion API for the frontend app.
  */
 
 import express from "express";
-import cors from "cors";
+import multer from "multer";
+import path from "node:path";
+import { v4 as uuidv4 } from "uuid";
+
+import * as supabaseService from "../src/config/supabase.js";
+import * as queueService from "../src/services/queue.service.js";
+import * as validationService from "../src/services/validation.service.js";
 
 const app = express();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024
+  }
+});
 
-const configuredOrigins = [
-  process.env.FRONTEND_URL,
-  ...(process.env.FRONTEND_URLS || "").split(",")
-]
-  .map((origin) => (origin || "").trim())
-  .filter(Boolean);
+const inputBucket = (process.env.SUPABASE_INPUT_BUCKET || process.env.SUPABASE_STORAGE_BUCKET || "docflow-inputs").trim();
 
-const corsOptionsDelegate = (req, callback) => {
-  const requestOrigin = req.header("Origin");
+const parseSupabasePath = (storedPath) => {
+  if (!storedPath) return null;
+  
+  // Handle Supabase cloud storage paths
+  if (storedPath.startsWith("supabase://")) {
+    const remainder = storedPath.slice("supabase://".length);
+    const slashIndex = remainder.indexOf("/");
+    if (slashIndex === -1) return null;
+    return {
+      type: "supabase",
+      bucket: remainder.slice(0, slashIndex),
+      objectPath: remainder.slice(slashIndex + 1)
+    };
+  }
+  
+  // Handle local base64 encoded paths: local://path/to/file|base64data
+  if (storedPath.startsWith("local://")) {
+    const remainder = storedPath.slice("local://".length);
+    const pipeIndex = remainder.indexOf("|");
+    if (pipeIndex === -1) return null;
+    return {
+      type: "local",
+      objectPath: remainder.slice(0, pipeIndex),
+      b64Content: remainder.slice(pipeIndex + 1)
+    };
+  }
+  
+  return null;
+};
 
-  if (configuredOrigins.length === 0) {
-    // Keep backend reachable if env vars are missing (safe default for non-credentialed requests).
-    callback(null, { origin: true, credentials: false });
-    return;
+const getDownloadName = (job) => {
+  const extension = job?.output_format || path.extname(job?.stored_output_path || "") || "";
+  const baseName = (job?.original_file_name || "download").replace(/\.[^.]*$/, "");
+  return `${baseName}${extension}`;
+};
+
+const uploadToSupabaseStorage = async (bucket, objectPath, file) => {
+  // If Supabase is configured, use cloud storage
+  if (supabaseService.supabase) {
+    const { error } = await supabaseService.supabase.storage.from(bucket).upload(objectPath, file.buffer, {
+      contentType: file.mimetype || "application/octet-stream",
+      upsert: true
+    });
+    if (error) throw error;
+    return `supabase://${bucket}/${objectPath}`;
   }
 
-  const isAllowed = Boolean(requestOrigin) && configuredOrigins.includes(requestOrigin);
+  // Otherwise, store file reference locally with base64 encoding for small files
+  const isSmallFile = file.size < 5 * 1024 * 1024; // 5MB threshold
+  if (isSmallFile) {
+    const b64Content = file.buffer.toString("base64");
+    return `local://${objectPath}|${b64Content}`;
+  }
 
-  callback(null, {
-    origin: isAllowed,
-    credentials: isAllowed,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-  });
+  // For larger files without Supabase, throw informative error
+  throw new Error(
+    `File too large (${(file.size / 1024 / 1024).toFixed(2)}MB) for local-only conversion. ` +
+    `Please configure Supabase for file storage: Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.`
+  );
+};
+
+const downloadSupabaseFile = async (bucket, objectPath) => {
+  if (!supabaseService.supabase) {
+    throw new Error("Supabase is not configured");
+  }
+
+  const { data, error } = await supabaseService.supabase.storage.from(bucket).download(objectPath);
+  if (error) {
+    throw error;
+  }
+
+  if (!data) {
+    throw new Error("File not found in storage");
+  }
+
+  const buffer = Buffer.from(await data.arrayBuffer());
+  return buffer;
+};
+
+const downloadLocalFile = (b64Content) => {
+  // Decode base64 content back to binary buffer
+  return Buffer.from(b64Content, "base64");
 };
 
 // Middleware
-app.use(cors(corsOptionsDelegate));
-app.options("*", cors(corsOptionsDelegate));
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Health check
+app.use((req, res, next) => {
+  const requestOrigin = req.header("Origin");
+
+  if (requestOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", requestOrigin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "false");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", req.header("Access-Control-Request-Headers") || "Content-Type");
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
 app.get("/", (req, res) => {
   res.json({
     message: "DocFlow Pro API",
@@ -50,7 +137,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// Health endpoint
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -58,7 +144,158 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// 404 handler
+app.post("/api/convert", upload.single("file"), async (req, res, next) => {
+  try {
+    const tool = req.body?.tool;
+    const file = req.file;
+
+    const validationErrors = validationService.validateFile(file, tool);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: validationErrors.join("; ")
+      });
+    }
+
+    // Supabase is optional - we have a local fallback for development/testing
+    const supabaseConfigured = Boolean(supabaseService.supabase);
+    if (!supabaseConfigured) {
+      console.warn(
+        "[WARN] Supabase not configured. Using local fallback for file storage. " +
+        "For production, set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables."
+      );
+    }
+
+    const jobId = uuidv4();
+    const toolConfig = validationService.getToolConfig(tool);
+    const inputFormat = path.extname(file.originalname).toLowerCase();
+    const outputFormat = toolConfig?.outputFormat || ".out";
+    const safeFileName = file.originalname.replaceAll(/[^a-zA-Z0-9._-]/g, "_");
+    const inputObjectPath = `inputs/${jobId}/${safeFileName}`;
+    const storedInputPath = await uploadToSupabaseStorage(inputBucket, inputObjectPath, file);
+
+    await supabaseService.createJobRecord({
+      jobId,
+      tool,
+      inputFormat,
+      outputFormat,
+      originalFileName: file.originalname,
+      inputPath: storedInputPath,
+      fileSize: file.size
+    });
+
+    await queueService.addConversionJob({
+      jobId,
+      tool,
+      inputPath: storedInputPath,
+      outputFormat,
+      originalFileName: file.originalname
+    });
+
+    await supabaseService.logUsage(req.ip || req.connection.remoteAddress, tool, file.size, "queued");
+
+    return res.status(201).json({
+      jobId,
+      status: "queued",
+      message: "Your file is queued for conversion"
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/jobs/:jobId", async (req, res, next) => {
+  try {
+    const { jobId } = req.params;
+    const dbRecord = await supabaseService.getJobRecord(jobId);
+
+    if (!dbRecord) {
+      return res.status(404).json({
+        error: "Job not found"
+      });
+    }
+
+    let progress = dbRecord.progress || 0;
+    if (!progress || progress === 0) {
+      const queueStatus = await queueService.getJobStatus(jobId);
+      progress = queueStatus?.progress || progress;
+    }
+
+    if (dbRecord.status === "completed") {
+      progress = 100;
+    }
+
+    const response = {
+      jobId,
+      status: dbRecord.status,
+      progress,
+      createdAt: dbRecord.created_at,
+      startedAt: dbRecord.started_at,
+      completedAt: dbRecord.completed_at
+    };
+
+    if (dbRecord.status === "completed") {
+      response.downloadUrl = `/api/download/${jobId}`;
+    }
+
+    if (dbRecord.status === "failed") {
+      response.message = dbRecord.error_message || "Conversion failed";
+    }
+
+    return res.json(response);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/download/:jobId", async (req, res, next) => {
+  try {
+    const { jobId } = req.params;
+    const job = await supabaseService.getJobRecord(jobId);
+
+    if (!job) {
+      return res.status(404).json({
+        error: "Job not found"
+      });
+    }
+
+    if (job.status !== "completed") {
+      return res.status(400).json({
+        error: "File is not ready for download"
+      });
+    }
+
+    if (job.expires_at && new Date(job.expires_at) < new Date()) {
+      return res.status(410).json({
+        error: "File has expired"
+      });
+    }
+
+    const remotePath = parseSupabasePath(job.stored_output_path);
+    const downloadName = getDownloadName(job);
+
+    if (remotePath) {
+      let buffer;
+      if (remotePath.type === "supabase") {
+        buffer = await downloadSupabaseFile(remotePath.bucket, remotePath.objectPath);
+      } else if (remotePath.type === "local") {
+        buffer = downloadLocalFile(remotePath.b64Content);
+      }
+      
+      if (buffer) {
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
+        return res.send(buffer);
+      }
+    }
+
+    return res.status(404).json({
+      error: "Converted file not available"
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({
     error: "Not found",
@@ -66,14 +303,25 @@ app.use((req, res) => {
   });
 });
 
-// Error handler
 app.use((err, req, res, next) => {
-  console.error("Error:", err);
-  res.status(500).json({
+  console.error("[ERROR]", err.message);
+  
+  // Provide diagnostic information for common configuration issues
+  let diagnostics = null;
+  if (err.message.includes("Supabase")) {
+    diagnostics = {
+      supabase_configured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
+      supabase_url_set: Boolean(process.env.SUPABASE_URL),
+      supabase_key_set: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+      hint: "Set environment variables SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for cloud file storage"
+    };
+  }
+  
+  res.status(err.status || 500).json({
     error: "Internal server error",
-    message: process.env.NODE_ENV === "development" ? err.message : "Something went wrong"
+    message: process.env.NODE_ENV === "development" ? err.message : "Something went wrong",
+    diagnostics: process.env.NODE_ENV === "development" ? diagnostics : undefined
   });
 });
 
-// Export app for Vercel
 export default app;

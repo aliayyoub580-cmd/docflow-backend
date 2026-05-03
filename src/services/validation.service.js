@@ -37,8 +37,8 @@ export const validateFile = (file, toolId) => {
     );
   }
 
-  // Check file exists
-  if (!file.path) {
+  // Serverless uploads use in-memory buffers instead of a local path.
+  if (!file.buffer && !file.path) {
     errors.push("File upload failed");
   }
 
