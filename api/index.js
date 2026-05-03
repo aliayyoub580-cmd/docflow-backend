@@ -149,6 +149,18 @@ app.post("/api/convert", upload.single("file"), async (req, res, next) => {
     const tool = req.body?.tool;
     const file = req.file;
 
+    if (!file) {
+      return res.status(400).json({
+        error: "No file provided"
+      });
+    }
+
+    if (!tool) {
+      return res.status(400).json({
+        error: "No tool specified"
+      });
+    }
+
     const validationErrors = validationService.validateFile(file, tool);
     if (validationErrors.length > 0) {
       return res.status(400).json({
@@ -171,7 +183,10 @@ app.post("/api/convert", upload.single("file"), async (req, res, next) => {
     const outputFormat = toolConfig?.outputFormat || ".out";
     const safeFileName = file.originalname.replaceAll(/[^a-zA-Z0-9._-]/g, "_");
     const inputObjectPath = `inputs/${jobId}/${safeFileName}`;
+    
+    console.log("[DEBUG] Uploading file:", { jobId, tool, fileName: safeFileName, fileSize: file.size });
     const storedInputPath = await uploadToSupabaseStorage(inputBucket, inputObjectPath, file);
+    console.log("[DEBUG] File uploaded:", { storedInputPath: storedInputPath.substring(0, 50) + "..." });
 
     await supabaseService.createJobRecord({
       jobId,
@@ -182,6 +197,7 @@ app.post("/api/convert", upload.single("file"), async (req, res, next) => {
       inputPath: storedInputPath,
       fileSize: file.size
     });
+    console.log("[DEBUG] Job record created:", jobId);
 
     await queueService.addConversionJob({
       jobId,
@@ -190,8 +206,10 @@ app.post("/api/convert", upload.single("file"), async (req, res, next) => {
       outputFormat,
       originalFileName: file.originalname
     });
+    console.log("[DEBUG] Job queued:", jobId);
 
     await supabaseService.logUsage(req.ip || req.connection.remoteAddress, tool, file.size, "queued");
+    console.log("[DEBUG] Usage logged");
 
     return res.status(201).json({
       jobId,
@@ -199,6 +217,7 @@ app.post("/api/convert", upload.single("file"), async (req, res, next) => {
       message: "Your file is queued for conversion"
     });
   } catch (error) {
+    console.error("[ERROR] POST /api/convert failed:", error);
     next(error);
   }
 });
@@ -304,11 +323,17 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error("[ERROR]", err.message);
+  console.error("[ERROR] Internal server error:", {
+    message: err.message,
+    stack: err.stack,
+    url: req.url,
+    method: req.method,
+    supabaseConfigured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  });
   
   // Provide diagnostic information for common configuration issues
   let diagnostics = null;
-  if (err.message.includes("Supabase")) {
+  if (err.message && err.message.includes("Supabase")) {
     diagnostics = {
       supabase_configured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
       supabase_url_set: Boolean(process.env.SUPABASE_URL),
