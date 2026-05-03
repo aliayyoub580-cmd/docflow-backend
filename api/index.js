@@ -17,10 +17,38 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: 50 * 1024 * 1024
+  },
+  fileFilter: (req, file, cb) => {
+    console.log("[DEBUG] Multer received file:", { originalname: file.originalname, mimetype: file.mimetype });
+    cb(null, true);
   }
 });
 
 const inputBucket = (process.env.SUPABASE_INPUT_BUCKET || process.env.SUPABASE_STORAGE_BUCKET || "docflow-inputs").trim();
+
+// Middleware to handle multer errors
+const multerErrorHandler = (err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    console.error("[ERROR] Multer error:", err.code, err.message);
+    if (err.code === "FILE_TOO_LARGE") {
+      return res.status(413).json({
+        error: "File too large",
+        message: "Maximum file size is 50MB"
+      });
+    }
+    if (err.code === "LIMIT_FILE_COUNT") {
+      return res.status(400).json({
+        error: "Too many files",
+        message: "Only one file allowed per request"
+      });
+    }
+    return res.status(400).json({
+      error: "File upload error",
+      message: err.message
+    });
+  }
+  next(err);
+};
 
 const parseSupabasePath = (storedPath) => {
   if (!storedPath) return null;
@@ -144,7 +172,7 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-app.post("/api/convert", upload.single("file"), async (req, res, next) => {
+app.post("/api/convert", upload.single("file"), multerErrorHandler, async (req, res, next) => {
   try {
     const tool = req.body?.tool;
     const file = req.file;
@@ -323,9 +351,12 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
+  const errorMessage = err?.message || "Unknown error";
+  const errorStack = err?.stack || "No stack available";
+  
   console.error("[ERROR] Internal server error:", {
-    message: err.message,
-    stack: err.stack,
+    message: errorMessage,
+    stack: errorStack,
     url: req.url,
     method: req.method,
     supabaseConfigured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
@@ -333,7 +364,7 @@ app.use((err, req, res, next) => {
   
   // Provide diagnostic information for common configuration issues
   let diagnostics = null;
-  if (err.message && err.message.includes("Supabase")) {
+  if (errorMessage && (typeof errorMessage === "string") && errorMessage.includes("Supabase")) {
     diagnostics = {
       supabase_configured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
       supabase_url_set: Boolean(process.env.SUPABASE_URL),
@@ -342,9 +373,10 @@ app.use((err, req, res, next) => {
     };
   }
   
-  res.status(err.status || 500).json({
+  const statusCode = err?.status || err?.statusCode || 500;
+  res.status(statusCode).json({
     error: "Internal server error",
-    message: process.env.NODE_ENV === "development" ? err.message : "Something went wrong",
+    message: process.env.NODE_ENV === "development" ? errorMessage : "Something went wrong",
     diagnostics: process.env.NODE_ENV === "development" ? diagnostics : undefined
   });
 });
